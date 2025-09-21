@@ -13,13 +13,11 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
-#include <cwctype>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <optional>
-#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -73,6 +71,22 @@ NtQueryInformationProcessFn ResolveNtQueryInformationProcess() {
   return fn;
 }
 
+std::string ToUtf8(const std::wstring &input) {
+  if (input.empty()) {
+    return std::string();
+  }
+  int required = WideCharToMultiByte(CP_UTF8, 0, input.c_str(),
+                                     static_cast<int>(input.size()), nullptr, 0,
+                                     nullptr, nullptr);
+  if (required <= 0) {
+    return std::string();
+  }
+  std::string output(static_cast<size_t>(required), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()),
+                      output.data(), required, nullptr, nullptr);
+  return output;
+}
+
 std::wstring FileTimeToRFC3339(const FILETIME &filetime) {
   SYSTEMTIME utc_system{};
   if (!FileTimeToSystemTime(&filetime, &utc_system)) {
@@ -86,6 +100,30 @@ std::wstring FileTimeToRFC3339(const FILETIME &filetime) {
     return L"";
   }
   return buffer;
+}
+
+std::wstring CollapseSpaces(const std::wstring &input) {
+  std::wstring result;
+  bool previousSpace = false;
+  bool insideQuotes = false;
+  for (wchar_t ch : input) {
+    if (ch == L'"') {
+      insideQuotes = !insideQuotes;
+      previousSpace = false;
+      result.push_back(ch);
+      continue;
+    }
+    if (!insideQuotes && ch == L' ') {
+      if (!previousSpace) {
+        result.push_back(ch);
+        previousSpace = true;
+      }
+    } else {
+      previousSpace = false;
+      result.push_back(ch);
+    }
+  }
+  return result;
 }
 
 std::wstring DescribeArchitecture(HANDLE process) {
@@ -447,6 +485,19 @@ SessionDiagnostics AnalyzeSession(const TokenDiagnostics &tokenDiag) {
   return session;
 }
 
+std::wstring DefaultSaveFileName() {
+  SYSTEMTIME local{};
+  GetLocalTime(&local);
+  wchar_t buffer[32];
+  int written = swprintf(buffer, std::size(buffer), L"%04u%02u%02u-%02u%02u%02u.txt",
+                         local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute,
+                         local.wSecond);
+  if (written < 0) {
+    return L"report.txt";
+  }
+  return buffer;
+}
+
 std::wstring DescribeSignatureStatus(LONG status) {
   switch (status) {
   case ERROR_SUCCESS:
@@ -665,38 +716,6 @@ StdHandles DetectStdHandles() {
 }
 
 
-struct Options {
-  bool watchParent = false;
-  std::wstring filter;
-};
-
-std::wstring ToLower(std::wstring value) {
-  for (auto &ch : value) {
-    ch = static_cast<wchar_t>(towlower(ch));
-  }
-  return value;
-}
-
-Options ParseOptions(int argc, wchar_t **argv) {
-  Options options;
-  for (int i = 1; i < argc; ++i) {
-    std::wstring arg = argv[i];
-    if (arg == L"--watch") {
-      options.watchParent = true;
-    } else if (arg.rfind(L"--filter=", 0) == 0) {
-      options.filter = arg.substr(9);
-    }
-  }
-  return options;
-}
-
-struct WatchResult {
-  bool requested = false;
-  bool awaited = false;
-  bool exitCodeValid = false;
-  DWORD exitCode = 0;
-};
-
 std::wstring BuildHashString(std::uint64_t value) {
   std::wostringstream oss;
   oss << L"0x" << std::hex << std::setw(16) << std::setfill(L'0') << value;
@@ -708,10 +727,9 @@ std::wstring BuildTextReport(const std::vector<std::wstring> &argv,
                              const TokenDiagnostics &token,
                              const SessionDiagnostics &session,
                              const EnvironmentSummary &env,
-                             const StdHandles &handles,
-                             const WatchResult &watch) {
+                             const StdHandles &handles) {
   std::wostringstream out;
-  out << L"Command line raw: " << GetCommandLineW() << L"\n";
+  out << L"Command line raw: " << CollapseSpaces(GetCommandLineW()) << L"\n";
   out << L"Arguments (argv):\n";
   for (size_t i = 0; i < argv.size(); ++i) {
     out << L"  [" << i << L"] " << argv[i] << L"\n";
@@ -732,7 +750,7 @@ std::wstring BuildTextReport(const std::vector<std::wstring> &argv,
           << DescribeSignatureStatus(*proc.signatureStatus) << L"\n";
     }
     if (!proc.commandLine.empty()) {
-      out << L"  Command line: " << proc.commandLine << L"\n";
+      out << L"  Command line: " << CollapseSpaces(proc.commandLine) << L"\n";
     }
     out << L"\n";
   }
@@ -781,30 +799,34 @@ std::wstring BuildTextReport(const std::vector<std::wstring> &argv,
   out << L"  stderr redirected: " << (handles.stdErrRedirected ? L"yes" : L"no")
       << L"\n";
 
-  if (watch.requested) {
-    out << L"\n";
-    out << L"Watch\n";
-    out << L"  Awaited: " << (watch.awaited ? L"yes" : L"no") << L"\n";
-    if (watch.awaited) {
-      out << L"  Exit code known: " << (watch.exitCodeValid ? L"yes" : L"no");
-      if (watch.exitCodeValid) {
-        out << L" (" << watch.exitCode << L")";
-      }
-      out << L"\n";
-    }
-  }
-
   out << L"\n";
   return out.str();
 }
 
 
 
+bool WriteToFile(const std::wstring &path, const std::wstring &content) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  std::string utf8 = ToUtf8(content);
+  DWORD written = 0;
+  bool ok = true;
+  if (!utf8.empty()) {
+    if (!WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written,
+                   nullptr)) {
+      ok = false;
+    }
+  }
+  CloseHandle(file);
+  return ok;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
-  Options options = ParseOptions(argc, argv);
-
   std::vector<std::wstring> args;
   args.reserve(static_cast<size_t>(argc));
   for (int i = 0; i < argc; ++i) {
@@ -812,45 +834,30 @@ int wmain(int argc, wchar_t **argv) {
   }
 
   auto chain = BuildAncestry(GetCurrentProcessId(), 4);
-  if (!chain.empty() && !options.filter.empty()) {
-    const auto &parent = chain.size() >= 2 ? chain[1] : chain.front();
-    std::wstring lowerParent = ToLower(parent.exeName);
-    std::wstring lowerFilter = ToLower(options.filter);
-    if (lowerParent.find(lowerFilter) == std::wstring::npos) {
-      std::wcout << L"Filter mismatch; exiting." << std::endl;
-      return 0;
-    }
-  }
-
   TokenDiagnostics tokenDiag = AnalyzeToken(GetCurrentProcess());
   SessionDiagnostics sessionDiag = AnalyzeSession(tokenDiag);
   EnvironmentSummary env = SummarizeEnvironment();
   StdHandles handles = DetectStdHandles();
 
-  WatchResult watch;
-  watch.requested = options.watchParent;
-  if (options.watchParent && chain.size() >= 2) {
-    HANDLE parentHandle =
-        OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
-                    chain[1].pid);
-    if (parentHandle) {
-      watch.awaited = true;
-      WaitForSingleObject(parentHandle, INFINITE);
-      DWORD exitCode = 0;
-      if (GetExitCodeProcess(parentHandle, &exitCode)) {
-        watch.exitCode = exitCode;
-        watch.exitCodeValid = true;
-      }
-      CloseHandle(parentHandle);
-    }
-  }
-
   std::wstring output = BuildTextReport(args, chain, tokenDiag, sessionDiag,
-                                           env, handles, watch);
+                                           env, handles);
 
   std::wcout << output;
+
+  std::wstring target = DefaultSaveFileName();
+  if (!WriteToFile(target, output)) {
+    std::wcerr << L"Failed to save report: " << target << L"\n";
+  } else {
+    std::wcout << L"Saved report to: " << target << L"\n";
+  }
+
+  std::wcout << L"Press any key to exit." << std::flush;
+  std::wstring dummy;
+  std::getline(std::wcin, dummy);
+
   return 0;
 }
+
 
 #else
 
